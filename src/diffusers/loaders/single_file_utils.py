@@ -20,6 +20,7 @@ import re
 from contextlib import nullcontext
 from io import BytesIO
 from urllib.parse import urlparse
+import transformers
 
 import requests
 import torch
@@ -2235,6 +2236,11 @@ def create_diffusers_qwen3_4b_model_from_checkpoint(
         local_files_only=local_files_only,
     )
 
+    qc = getattr(model_config, "quantization_config", None)
+
+    if isinstance(qc, transformers.utils.quantization_config.PipelineQuantizationConfig) and not hasattr(qc, "quant_method"):
+        model_config.quantization_config = None
+
     ctx = init_empty_weights if is_accelerate_available() else nullcontext
     with ctx():
         model = cls(model_config)
@@ -2247,15 +2253,14 @@ def create_diffusers_qwen3_4b_model_from_checkpoint(
     else:
         model.load_state_dict(diffusers_format_checkpoint, strict=False)
 
-    use_keep_in_fp32_modules = (cls._keep_in_fp32_modules is not None) and (torch_dtype == torch.float16)
-    if use_keep_in_fp32_modules:
-        keep_in_fp32_modules = model._keep_in_fp32_modules
-    else:
-        keep_in_fp32_modules = []
+    use_keep_in_fp32_modules = (getattr(cls, "_keep_in_fp32_modules", None) is not None) and (
+        torch_dtype == torch.float16
+    )
+    keep_in_fp32_modules = cls._keep_in_fp32_modules if use_keep_in_fp32_modules else []
 
-    if keep_in_fp32_modules is not None:
+    if keep_in_fp32_modules:
         for name, param in model.named_parameters():
-            if any(module_to_keep_in_fp32 in name.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules):
+            if any(m in name.split(".") for m in keep_in_fp32_modules):
                 param.data = param.data.to(torch.float32)
 
     if torch_dtype is not None:
