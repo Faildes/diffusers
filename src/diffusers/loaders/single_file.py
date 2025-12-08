@@ -374,6 +374,25 @@ class FromSingleFileMixin:
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
         disable_mmap = kwargs.pop("disable_mmap", False)
+        
+        pipeline_quantization_config = kwargs.pop("quantization_config", None)
+
+        def _get_quant_config_for(component_name: str):
+            if pipeline_quantization_config is None:
+                return None
+
+            if isinstance(pipeline_quantization_config, dict):
+                return (
+                    pipeline_quantization_config.get(component_name)
+                    or pipeline_quantization_config.get("*")
+                )
+
+            quant_mapping = getattr(pipeline_quantization_config, "quant_mapping", None)
+            if isinstance(quant_mapping, dict):
+                fallback = getattr(pipeline_quantization_config, "fallback", None)
+                return quant_mapping.get(component_name, fallback)
+
+            return pipeline_quantization_config
 
         is_legacy_loading = False
 
@@ -512,12 +531,18 @@ class FromSingleFileMixin:
         ):
             loaded_sub_model = None
             is_pipeline_module = hasattr(pipelines, library_name)
+            
+            per_component_quant_config = _get_quant_config_for(name)
 
             if name in passed_class_obj:
                 loaded_sub_model = passed_class_obj[name]
 
             else:
                 try:
+                    submodel_kwargs = dict(kwargs)
+                    if per_component_quant_config is not None:
+                        submodel_kwargs["quantization_config"] = per_component_quant_config
+                        
                     loaded_sub_model = load_single_file_sub_model(
                         library_name=library_name,
                         class_name=class_name,
@@ -531,7 +556,7 @@ class FromSingleFileMixin:
                         local_files_only=local_files_only,
                         is_legacy_loading=is_legacy_loading,
                         disable_mmap=disable_mmap,
-                        **kwargs,
+                        **submodel_kwargs,
                     )
                 except SingleFileComponentError as e:
                     raise SingleFileComponentError(
