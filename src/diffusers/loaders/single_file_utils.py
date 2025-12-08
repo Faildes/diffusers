@@ -563,6 +563,14 @@ def is_clip_model_in_single_file(class_obj, checkpoint):
     return False
 
 
+def is_qwen3_4b_in_single_file(checkpoint):
+    if any(k.startswith("text_encoders.qwen3_4b.") for k in checkpoint.keys()):
+        return True
+    if "text_encoders.qwen3_4b.model.embed_tokens.weight" in checkpoint:
+        return True
+    return False
+
+
 def infer_diffusers_model_type(checkpoint):
     if (
         CHECKPOINT_KEY_NAMES["inpainting"] in checkpoint
@@ -2191,6 +2199,69 @@ def create_diffusers_t5_model_from_checkpoint(
                 # param = param.to(torch.float32) does not work here as only in the local scope.
                 param.data = param.data.to(torch.float32)
 
+    return model
+
+
+def convert_qwen3_4b_checkpoint_to_diffusers(checkpoint):
+    keys = list(checkpoint.keys())
+    text_model_dict = {}
+
+    remove_prefix = "text_encoders.qwen3_4b."
+
+    for key in keys:
+        if key.startswith(remove_prefix):
+            diffusers_key = key[len(remove_prefix) :]
+            text_model_dict[diffusers_key] = checkpoint.get(key)
+
+    return text_model_dict
+
+
+def create_diffusers_qwen3_4b_model_from_checkpoint(
+    cls,
+    checkpoint,
+    subfolder="",
+    config=None,
+    torch_dtype=None,
+    local_files_only=None,
+):
+    if config:
+        config = {"pretrained_model_name_or_path": config}
+    else:
+        config = fetch_diffusers_config(checkpoint)
+
+    model_config = cls.config_class.from_pretrained(
+        **config,
+        subfolder=subfolder,
+        local_files_only=local_files_only,
+    )
+
+    ctx = init_empty_weights if is_accelerate_available() else nullcontext
+    with ctx():
+        model = cls(model_config)
+
+    diffusers_format_checkpoint = convert_qwen3_4b_checkpoint_to_diffusers(checkpoint)
+
+    if is_accelerate_available():
+        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
+        empty_device_cache()
+    else:
+        model.load_state_dict(diffusers_format_checkpoint, strict=False)
+
+    use_keep_in_fp32_modules = (cls._keep_in_fp32_modules is not None) and (torch_dtype == torch.float16)
+    if use_keep_in_fp32_modules:
+        keep_in_fp32_modules = model._keep_in_fp32_modules
+    else:
+        keep_in_fp32_modules = []
+
+    if keep_in_fp32_modules is not None:
+        for name, param in model.named_parameters():
+            if any(module_to_keep_in_fp32 in name.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules):
+                param.data = param.data.to(torch.float32)
+
+    if torch_dtype is not None:
+        model.to(torch_dtype)
+
+    model.eval()
     return model
 
 
@@ -3870,7 +3941,9 @@ def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
     def update_state_dict(state_dict: dict[str, object], old_key: str, new_key: str) -> None:
         state_dict[new_key] = state_dict.pop(old_key)
 
-    converted_state_dict = {key: checkpoint.pop(key) for key in list(checkpoint.keys())}
+    converted_state_dict = {
+        key: checkpoint.pop(key) for key in list(checkpoint.keys()) if not key.startswith("vae.")
+    }
 
     # Handle single file --> diffusers key remapping via the remap dict
     for key in list(converted_state_dict.keys()):
@@ -3889,3 +3962,4 @@ def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
             handler_fn_inplace(key, converted_state_dict)
 
     return converted_state_dict
+

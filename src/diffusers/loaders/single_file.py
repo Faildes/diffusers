@@ -31,10 +31,12 @@ from .single_file_utils import (
     _legacy_load_scheduler,
     create_diffusers_clip_model_from_ldm,
     create_diffusers_t5_model_from_checkpoint,
+    create_diffusers_qwen3_4b_model_from_checkpoint,
     fetch_diffusers_config,
     fetch_original_config,
     is_clip_model_in_single_file,
     is_t5_in_single_file,
+    is_qwen3_4b_in_single_file,
     load_single_file_checkpoint,
 )
 
@@ -125,6 +127,16 @@ def load_single_file_sub_model(
 
     elif is_transformers_model and is_t5_in_single_file(checkpoint):
         loaded_sub_model = create_diffusers_t5_model_from_checkpoint(
+            class_obj,
+            checkpoint=checkpoint,
+            config=cached_model_config_path,
+            subfolder=name,
+            torch_dtype=torch_dtype,
+            local_files_only=local_files_only,
+        )
+        
+    elif is_transformers_model and is_qwen3_4b_in_single_file(checkpoint):
+        loaded_sub_model = create_diffusers_qwen3_4b_model_from_checkpoint(
             class_obj,
             checkpoint=checkpoint,
             config=cached_model_config_path,
