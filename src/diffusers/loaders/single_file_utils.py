@@ -120,7 +120,7 @@ CHECKPOINT_KEY_NAMES = {
     "hunyuan-video": "txt_in.individual_token_refiner.blocks.0.adaLN_modulation.1.bias",
     "instruct-pix2pix": "model.diffusion_model.input_blocks.0.0.weight",
     "lumina2": ["model.diffusion_model.cap_embedder.0.weight", "cap_embedder.0.weight"],
-    "z-image-turbo": "cap_embedder.0.weight",
+    "z-image-turbo": ["cap_embedder.0.weight", "model.diffusion_model.cap_embedder.0.weight"],
     "sana": [
         "blocks.0.cross_attn.q_linear.weight",
         "blocks.0.cross_attn.q_linear.bias",
