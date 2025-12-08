@@ -2219,47 +2219,57 @@ def convert_qwen3_4b_checkpoint_to_diffusers(checkpoint):
 def create_diffusers_qwen3_4b_model_from_checkpoint(
     cls,
     checkpoint,
-    subfolder="",
-    config=None,
+    subfolder: str = "",
+    config: Optional[str] = None,
     torch_dtype=None,
     local_files_only=None,
+    **model_kwargs,
 ):
     if config:
-        config = {"pretrained_model_name_or_path": config}
+        config_dict = {"pretrained_model_name_or_path": config}
     else:
-        config = fetch_diffusers_config(checkpoint)
+        config_dict = fetch_diffusers_config(checkpoint)
 
     model_config = cls.config_class.from_pretrained(
-        **config,
+        **config_dict,
         subfolder=subfolder,
         local_files_only=local_files_only,
     )
 
-    ctx = init_empty_weights if is_accelerate_available() else nullcontext
-    with ctx():
-        model = cls(model_config)
+    model = cls(model_config)
 
     diffusers_format_checkpoint = convert_qwen3_4b_checkpoint_to_diffusers(checkpoint)
 
-    if is_accelerate_available():
-        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
-        empty_device_cache()
-    else:
-        model.load_state_dict(diffusers_format_checkpoint, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(
+        diffusers_format_checkpoint, strict=False
+    )
 
-    use_keep_in_fp32_modules = (cls._keep_in_fp32_modules is not None) and (torch_dtype == torch.float16)
-    if use_keep_in_fp32_modules:
-        keep_in_fp32_modules = model._keep_in_fp32_modules
-    else:
-        keep_in_fp32_modules = []
+    if missing_keys:
+        logger.info(
+            "Missing keys when loading qwen3_4b text encoder: %s",
+            missing_keys,
+        )
+    if unexpected_keys:
+        logger.info(
+            "Unexpected keys when loading qwen3_4b text encoder: %s",
+            unexpected_keys,
+        )
 
-    if keep_in_fp32_modules is not None:
+    use_keep_in_fp32_modules = (
+        getattr(cls, "_keep_in_fp32_modules", None) is not None
+        and torch_dtype == torch.float16
+    )
+    keep_in_fp32_modules = (
+        cls._keep_in_fp32_modules if use_keep_in_fp32_modules else []
+    )
+
+    if keep_in_fp32_modules:
         for name, param in model.named_parameters():
-            if any(module_to_keep_in_fp32 in name.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules):
+            if any(m in name.split(".") for m in keep_in_fp32_modules):
                 param.data = param.data.to(torch.float32)
 
     if torch_dtype is not None:
-        model.to(torch_dtype)
+        model.to(dtype=torch_dtype)
 
     model.eval()
     return model
