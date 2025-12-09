@@ -20,6 +20,7 @@ import re
 from contextlib import nullcontext
 from io import BytesIO
 from urllib.parse import urlparse
+from typing import Dict, Optional
 
 import requests
 import torch
@@ -82,6 +83,7 @@ CHECKPOINT_KEY_NAMES = {
     "open_clip_sdxl": "conditioner.embedders.1.model.positional_embedding",
     "open_clip_sdxl_refiner": "conditioner.embedders.0.model.text_projection",
     "open_clip_sd3": "text_encoders.clip_g.transformer.text_model.embeddings.position_embedding.weight",
+    "qwen3_4b": "text_encoders.qwen3_4b.logit_scale",
     "stable_cascade_stage_b": "down_blocks.1.0.channelwise.0.weight",
     "stable_cascade_stage_c": "clip_txt_mapper.weight",
     "sd3": [
@@ -120,7 +122,10 @@ CHECKPOINT_KEY_NAMES = {
     "hunyuan-video": "txt_in.individual_token_refiner.blocks.0.adaLN_modulation.1.bias",
     "instruct-pix2pix": "model.diffusion_model.input_blocks.0.0.weight",
     "lumina2": ["model.diffusion_model.cap_embedder.0.weight", "cap_embedder.0.weight"],
-    "z-image-turbo": ["cap_embedder.0.weight", "model.diffusion_model.cap_embedder.0.weight"],
+    "z-image-turbo": [
+        "cap_embedder.0.weight",
+        "model.diffusion_model.cap_embedder.0.weight",
+    ],
     "sana": [
         "blocks.0.cross_attn.q_linear.weight",
         "blocks.0.cross_attn.q_linear.bias",
@@ -563,12 +568,25 @@ def is_clip_model_in_single_file(class_obj, checkpoint):
     return False
 
 
-def is_qwen3_4b_in_single_file(checkpoint):
-    if any(k.startswith("text_encoders.qwen3_4b.") for k in checkpoint.keys()):
-        return True
-    if "text_encoders.qwen3_4b.model.embed_tokens.weight" in checkpoint:
-        return True
-    return False
+def is_zimage_qwen_in_single_file(checkpoint):
+    return any(
+        k in checkpoint
+        for k in (
+            "text_encoders.qwen3_4b.logit_scale",
+            "text_encoders.qwen3_4b.model.embed_tokens.weight",
+        )
+    )
+    
+
+def get_zimage_layout(checkpoint):
+    has_split = "cap_embedder.0.weight" in checkpoint
+    has_aio = "model.diffusion_model.cap_embedder.0.weight" in checkpoint
+
+    if has_aio:
+        return "aio"
+    if has_split:
+        return "split"
+    return None
 
 
 def infer_diffusers_model_type(checkpoint):
@@ -731,15 +749,11 @@ def infer_diffusers_model_type(checkpoint):
     ):
         model_type = "instruct-pix2pix"
 
-    elif any(key in checkpoint for key in CHECKPOINT_KEY_NAMES["z-image-turbo"]):
-        for k in CHECKPOINT_KEY_NAMES["z-image-turbo"]:
-            if k in checkpoint:
-                if checkpoint[k].shape[0] == 2560:
-                    model_type = "z-image-turbo"
-                    break
-        else:
-            model_type = "z-image-turbo"
-
+    elif (
+        CHECKPOINT_KEY_NAMES["z-image-turbo"] in checkpoint
+        and checkpoint[CHECKPOINT_KEY_NAMES["z-image-turbo"]].shape[0] == 2560
+    ):
+        model_type = "z-image-turbo"
 
     elif any(key in checkpoint for key in CHECKPOINT_KEY_NAMES["lumina2"]):
         model_type = "lumina2"
@@ -2202,76 +2216,66 @@ def create_diffusers_t5_model_from_checkpoint(
     return model
 
 
-def convert_qwen3_4b_checkpoint_to_diffusers(checkpoint):
-    keys = list(checkpoint.keys())
+def convert_zimage_qwen_checkpoint_to_diffusers(
+    checkpoint,
+    prefix="text_encoders.qwen3_4b.",
+):
     text_model_dict = {}
-
-    remove_prefix = "text_encoders.qwen3_4b."
+    keys = list(checkpoint.keys())
 
     for key in keys:
-        if key.startswith(remove_prefix):
-            diffusers_key = key[len(remove_prefix) :]
-            text_model_dict[diffusers_key] = checkpoint.get(key)
+        if not key.startswith(prefix):
+            continue
+
+        diffusers_key = key[len(prefix) :]
+        text_model_dict[diffusers_key] = checkpoint[key]
 
     return text_model_dict
 
 
-def create_diffusers_qwen3_4b_model_from_checkpoint(
+def create_diffusers_qwen_model_from_checkpoint(
     cls,
     checkpoint,
-    subfolder: str = "",
-    config: Optional[str] = None,
+    subfolder="",
+    config=None,
     torch_dtype=None,
     local_files_only=None,
-    **model_kwargs,
 ):
     if config:
-        config_dict = {"pretrained_model_name_or_path": config}
+        config = {"pretrained_model_name_or_path": config}
     else:
-        config_dict = fetch_diffusers_config(checkpoint)
+        config = fetch_diffusers_config(checkpoint)
 
     model_config = cls.config_class.from_pretrained(
-        **config_dict,
+        **config,
         subfolder=subfolder,
         local_files_only=local_files_only,
     )
 
-    model = cls(model_config)
+    ctx = init_empty_weights if is_accelerate_available() else nullcontext
+    with ctx():
+        model = cls(model_config)
 
-    diffusers_format_checkpoint = convert_qwen3_4b_checkpoint_to_diffusers(checkpoint)
+    diffusers_format_checkpoint = convert_zimage_qwen_checkpoint_to_diffusers(checkpoint)
 
-    missing_keys, unexpected_keys = model.load_state_dict(
-        diffusers_format_checkpoint, strict=False
-    )
-
-    if missing_keys:
-        logger.info(
-            "Missing keys when loading qwen3_4b text encoder: %s",
-            missing_keys,
-        )
-    if unexpected_keys:
-        logger.info(
-            "Unexpected keys when loading qwen3_4b text encoder: %s",
-            unexpected_keys,
-        )
+    if is_accelerate_available():
+        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
+        empty_device_cache()
+    else:
+        model.load_state_dict(diffusers_format_checkpoint)
 
     use_keep_in_fp32_modules = (
         getattr(cls, "_keep_in_fp32_modules", None) is not None
         and torch_dtype == torch.float16
     )
-    keep_in_fp32_modules = (
-        cls._keep_in_fp32_modules if use_keep_in_fp32_modules else []
-    )
 
-    if keep_in_fp32_modules:
+    keep_in_fp32_modules = getattr(model, "_keep_in_fp32_modules", []) if use_keep_in_fp32_modules else []
+
+    if keep_in_fp32_modules is not None:
         for name, param in model.named_parameters():
-            if any(m in name.split(".") for m in keep_in_fp32_modules):
+            if any(module_to_keep in name.split(".") for module_to_keep in keep_in_fp32_modules):
                 param.data = param.data.to(torch.float32)
 
-    if torch_dtype is not None:
-        model.to(dtype=torch_dtype)
-
-    model.eval()
     return model
 
 
@@ -3951,9 +3955,7 @@ def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
     def update_state_dict(state_dict: dict[str, object], old_key: str, new_key: str) -> None:
         state_dict[new_key] = state_dict.pop(old_key)
 
-    converted_state_dict = {
-        key: checkpoint.pop(key) for key in list(checkpoint.keys()) if not key.startswith("vae.")
-    }
+    converted_state_dict = {key: checkpoint.pop(key) for key in list(checkpoint.keys())}
 
     # Handle single file --> diffusers key remapping via the remap dict
     for key in list(converted_state_dict.keys()):
@@ -3973,3 +3975,5 @@ def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
     return converted_state_dict
 
+def is_z_image_aio_checkpoint(checkpoint):
+    
