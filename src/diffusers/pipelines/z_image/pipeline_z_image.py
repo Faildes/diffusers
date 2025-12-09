@@ -16,7 +16,7 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from transformers import AutoTokenizer, PreTrainedModel
+from transformers import AutoTokenizer, PreTrainedModel, Qwen2Tokenizer, Qwen3Model
 
 from ...image_processor import VaeImageProcessor
 from ...loaders import FromSingleFileMixin, ZImageLoraLoaderMixin
@@ -143,8 +143,8 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         self,
         scheduler: FlowMatchEulerDiscreteScheduler,
         vae: AutoencoderKL,
-        text_encoder: PreTrainedModel,
-        tokenizer: AutoTokenizer,
+        text_encoder: Qwen3Model,
+        tokenizer: Qwen2Tokenizer,
         transformer: ZImageTransformer2DModel,
     ):
         super().__init__()

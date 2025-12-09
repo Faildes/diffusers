@@ -31,13 +31,13 @@ from .single_file_utils import (
     _legacy_load_scheduler,
     create_diffusers_clip_model_from_ldm,
     create_diffusers_t5_model_from_checkpoint,
-    create_diffusers_zimage_qwen_model_from_checkpoint,
     fetch_diffusers_config,
     fetch_original_config,
     is_clip_model_in_single_file,
     is_t5_in_single_file,
-    is_zimage_qwen_in_single_file
     load_single_file_checkpoint,
+    is_qwen3_in_single_file,
+    create_diffusers_qwen3_model_from_checkpoint,
 )
 
 
@@ -135,8 +135,8 @@ def load_single_file_sub_model(
             local_files_only=local_files_only,
         )
         
-    elif is_transformers_model and is_zimage_qwen_in_single_file(checkpoint):
-        loaded_sub_model = create_diffusers_qwen_model_from_checkpoint(
+    elif is_transformers_model and is_qwen3_in_single_file(checkpoint):
+        loaded_sub_model = create_diffusers_qwen3_model_from_checkpoint(
             class_obj,
             checkpoint=checkpoint,
             config=cached_model_config_path,
@@ -374,25 +374,6 @@ class FromSingleFileMixin:
         revision = kwargs.pop("revision", None)
         torch_dtype = kwargs.pop("torch_dtype", None)
         disable_mmap = kwargs.pop("disable_mmap", False)
-        
-        pipeline_quantization_config = kwargs.pop("quantization_config", None)
-
-        def _get_quant_config_for(component_name: str):
-            if pipeline_quantization_config is None:
-                return None
-
-            if isinstance(pipeline_quantization_config, dict):
-                return (
-                    pipeline_quantization_config.get(component_name)
-                    or pipeline_quantization_config.get("*")
-                )
-
-            quant_mapping = getattr(pipeline_quantization_config, "quant_mapping", None)
-            if isinstance(quant_mapping, dict):
-                fallback = getattr(pipeline_quantization_config, "fallback", None)
-                return quant_mapping.get(component_name, fallback)
-
-            return pipeline_quantization_config
 
         is_legacy_loading = False
 
@@ -531,18 +512,12 @@ class FromSingleFileMixin:
         ):
             loaded_sub_model = None
             is_pipeline_module = hasattr(pipelines, library_name)
-            
-            per_component_quant_config = _get_quant_config_for(name)
 
             if name in passed_class_obj:
                 loaded_sub_model = passed_class_obj[name]
 
             else:
                 try:
-                    submodel_kwargs = dict(kwargs)
-                    if per_component_quant_config is not None:
-                        submodel_kwargs["quantization_config"] = per_component_quant_config
-                        
                     loaded_sub_model = load_single_file_sub_model(
                         library_name=library_name,
                         class_name=class_name,
@@ -556,7 +531,7 @@ class FromSingleFileMixin:
                         local_files_only=local_files_only,
                         is_legacy_loading=is_legacy_loading,
                         disable_mmap=disable_mmap,
-                        **submodel_kwargs,
+                        **kwargs,
                     )
                 except SingleFileComponentError as e:
                     raise SingleFileComponentError(

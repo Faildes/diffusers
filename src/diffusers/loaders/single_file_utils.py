@@ -20,7 +20,7 @@ import re
 from contextlib import nullcontext
 from io import BytesIO
 from urllib.parse import urlparse
-from typing import Dict, Optional
+from typing import Optional
 
 import requests
 import torch
@@ -83,7 +83,6 @@ CHECKPOINT_KEY_NAMES = {
     "open_clip_sdxl": "conditioner.embedders.1.model.positional_embedding",
     "open_clip_sdxl_refiner": "conditioner.embedders.0.model.text_projection",
     "open_clip_sd3": "text_encoders.clip_g.transformer.text_model.embeddings.position_embedding.weight",
-    "qwen3_4b": "text_encoders.qwen3_4b.logit_scale",
     "stable_cascade_stage_b": "down_blocks.1.0.channelwise.0.weight",
     "stable_cascade_stage_c": "clip_txt_mapper.weight",
     "sd3": [
@@ -566,27 +565,6 @@ def is_clip_model_in_single_file(class_obj, checkpoint):
         return True
 
     return False
-
-
-def is_zimage_qwen_in_single_file(checkpoint):
-    return any(
-        k in checkpoint
-        for k in (
-            "text_encoders.qwen3_4b.logit_scale",
-            "text_encoders.qwen3_4b.model.embed_tokens.weight",
-        )
-    )
-    
-
-def get_zimage_layout(checkpoint):
-    has_split = "cap_embedder.0.weight" in checkpoint
-    has_aio = "model.diffusion_model.cap_embedder.0.weight" in checkpoint
-
-    if has_aio:
-        return "aio"
-    if has_split:
-        return "split"
-    return None
 
 
 def infer_diffusers_model_type(checkpoint):
@@ -1460,6 +1438,15 @@ def convert_controlnet_checkpoint(
 
 
 def convert_ldm_vae_checkpoint(checkpoint, config):
+    if any(k.startswith("vae.") for k in checkpoint.keys()):
+        vae_only = {}
+        prefix = "vae."
+        for k, v in checkpoint.items():
+            if not k.startswith(prefix):
+                continue
+            new_k = k[len(prefix):]  # encoder.conv_in.weight
+            vae_only[new_k] = v
+        checkpoint = vae_only
     # extract state dict for VAE
     # remove the LDM_VAE_KEY prefix from the ldm checkpoint keys so that it is easier to map them to diffusers keys
     vae_state_dict = {}
@@ -2211,69 +2198,6 @@ def create_diffusers_t5_model_from_checkpoint(
         for name, param in model.named_parameters():
             if any(module_to_keep_in_fp32 in name.split(".") for module_to_keep_in_fp32 in keep_in_fp32_modules):
                 # param = param.to(torch.float32) does not work here as only in the local scope.
-                param.data = param.data.to(torch.float32)
-
-    return model
-
-
-def convert_zimage_qwen_checkpoint_to_diffusers(
-    checkpoint,
-    prefix="text_encoders.qwen3_4b.",
-):
-    text_model_dict = {}
-    keys = list(checkpoint.keys())
-
-    for key in keys:
-        if not key.startswith(prefix):
-            continue
-
-        diffusers_key = key[len(prefix) :]
-        text_model_dict[diffusers_key] = checkpoint[key]
-
-    return text_model_dict
-
-
-def create_diffusers_qwen_model_from_checkpoint(
-    cls,
-    checkpoint,
-    subfolder="",
-    config=None,
-    torch_dtype=None,
-    local_files_only=None,
-):
-    if config:
-        config = {"pretrained_model_name_or_path": config}
-    else:
-        config = fetch_diffusers_config(checkpoint)
-
-    model_config = cls.config_class.from_pretrained(
-        **config,
-        subfolder=subfolder,
-        local_files_only=local_files_only,
-    )
-
-    ctx = init_empty_weights if is_accelerate_available() else nullcontext
-    with ctx():
-        model = cls(model_config)
-
-    diffusers_format_checkpoint = convert_zimage_qwen_checkpoint_to_diffusers(checkpoint)
-
-    if is_accelerate_available():
-        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
-        empty_device_cache()
-    else:
-        model.load_state_dict(diffusers_format_checkpoint)
-
-    use_keep_in_fp32_modules = (
-        getattr(cls, "_keep_in_fp32_modules", None) is not None
-        and torch_dtype == torch.float16
-    )
-
-    keep_in_fp32_modules = getattr(model, "_keep_in_fp32_modules", []) if use_keep_in_fp32_modules else []
-
-    if keep_in_fp32_modules is not None:
-        for name, param in model.named_parameters():
-            if any(module_to_keep in name.split(".") for module_to_keep in keep_in_fp32_modules):
                 param.data = param.data.to(torch.float32)
 
     return model
@@ -3923,7 +3847,19 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
     return converted_state_dict
 
 
-def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
+def convert_z_image_transformer_checkpoint_to_diffusers(config, checkpoint, **kwargs):
+    if any(k.startswith("model.diffusion_model.") for k in checkpoint.keys()):
+        filtered = {}
+        prefix = "model.diffusion_model."
+
+        for k, v in checkpoint.items():
+            if not k.startswith(prefix):
+                continue
+            new_k = k[len(prefix):]
+            filtered[new_k] = v
+
+        checkpoint = filtered
+        
     Z_IMAGE_KEYS_RENAME_DICT = {
         "final_layer.": "all_final_layer.2-1.",
         "x_embedder.": "all_x_embedder.2-1.",
@@ -3975,5 +3911,117 @@ def convert_z_image_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
     return converted_state_dict
 
-def is_z_image_aio_checkpoint(checkpoint):
+
+
+def split_zimage_aio_checkpoint(checkpoint: dict):
+    transformer_prefix = "model.diffusion_model."
+    text_prefix = "text_encoders.qwen3_4b."
+    vae_prefix = "vae."
+
+    transformer_sd = {}
+    text_sd = {}
+    vae_sd = {}
+    others = {}
+
+    for k, v in checkpoint.items():
+        if k.startswith(transformer_prefix):
+            new_k = k[len(transformer_prefix):]  # cap_embedder.0.weight
+            transformer_sd[new_k] = v
+        elif k.startswith(text_prefix):
+            new_k = k[len(text_prefix):]         # model.embed_tokens.weight
+            text_sd[new_k] = v
+        elif k.startswith(vae_prefix):
+            new_k = k[len(vae_prefix):]         # decoder.conv_in.weight
+            vae_sd[new_k] = v
+        else:
+            others[k] = v                       # scheduler / metadata
+
+    return transformer_sd, text_sd, vae_sd, others
+
+
+def is_zimage_aio_checkpoint(checkpoint: dict) -> bool:
+    return "model.diffusion_model.cap_embedder.0.weight" in checkpoint
+
+
+def is_zimage_qwen3_in_single_file(checkpoint: dict) -> bool:
+    return any(k.startswith("text_encoders.qwen3_4b.") for k in checkpoint)
+
+
+def convert_zimage_qwen3_checkpoint_to_diffusers(checkpoint: dict) -> dict:
+    prefix = "text_encoders.qwen3_4b."
+    text_model_dict = {}
+
+    for key, value in checkpoint.items():
+        if not key.startswith(prefix):
+            continue
+
+        subkey = key[len(prefix):]
+        
+        if subkey == "logit_scale":
+            continue
+
+        text_model_dict[subkey] = value
+
+    return text_model_dict
+
+
+def create_diffusers_qwen3_model_from_checkpoint(
+    cls,
+    checkpoint: dict,
+    subfolder: str = "",
+    config: Optional[str] = None,
+    torch_dtype=None,
+    local_files_only: Optional[bool] = None,
+):
+    if config:
+        config = {"pretrained_model_name_or_path": config}
+    else:
+        config = fetch_diffusers_config(checkpoint)
+        
+    model_config = cls.config_class.from_pretrained(
+        **config,
+        subfolder=subfolder,
+        local_files_only=local_files_only,
+    )
+
+    ctx = init_empty_weights if is_accelerate_available() else nullcontext
+    with ctx():
+        model = cls(model_config)
+        
+    diffusers_format_checkpoint = convert_zimage_qwen3_checkpoint_to_diffusers(checkpoint)
+
+    if is_accelerate_available():
+        load_model_dict_into_meta(model, diffusers_format_checkpoint, dtype=torch_dtype)
+        empty_device_cache()
+    else:
+        model.load_state_dict(diffusers_format_checkpoint)
+
+    use_keep_in_fp32_modules = (getattr(cls, "_keep_in_fp32_modules", None) is not None) and (
+        torch_dtype == torch.float16
+    )
+    if use_keep_in_fp32_modules:
+        keep_in_fp32_modules = cls._keep_in_fp32_modules
+        if not isinstance(keep_in_fp32_modules, list):
+            keep_in_fp32_modules = [keep_in_fp32_modules]
+        for name, param in model.named_parameters():
+            if any(m in name.split(".") for m in keep_in_fp32_modules):
+                param.data = param.data.to(torch.float32)
+
+    return model
+
+
+def _load_zimage_qwen2_tokenizer(cls, checkpoint, config=None, local_files_only=False):
+    if config:
+        config = {"pretrained_model_name_or_path": config}
+    else:
+        config = fetch_diffusers_config(checkpoint)
     
+    config["pretrained_model_name_or_path"] = "Qwen/Qwen2-XXX"
+
+    tokenizer = cls.from_pretrained(
+        **config,
+        subfolder="tokenizer",
+        local_files_only=local_files_only,
+    )
+
+    return tokenizer
