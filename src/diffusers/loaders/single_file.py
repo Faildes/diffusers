@@ -36,10 +36,11 @@ from .single_file_utils import (
     is_clip_model_in_single_file,
     is_t5_in_single_file,
     load_single_file_checkpoint,
-    is_qwen3_in_single_file,
+    is_zimage_qwen3_in_single_file,
     create_diffusers_qwen3_model_from_checkpoint,
 )
 
+from ..quantizers import PipelineQuantizationConfig
 
 logger = logging.get_logger(__name__)
 
@@ -66,6 +67,15 @@ def load_single_file_sub_model(
     disable_mmap=False,
     **kwargs,
 ):
+    pipeline_quant_config = kwargs.pop("quantization_config", None)
+    per_component_quant_config = None
+
+    if isinstance(pipeline_quant_config, PipelineQuantizationConfig):
+        if pipeline_quant_config.quant_mapping is not None:
+            per_component_quant_config = pipeline_quant_config.quant_mapping.get(name)
+    else:
+        per_component_quant_config = pipeline_quant_config
+        
     if is_pipeline_module:
         pipeline_module = getattr(pipelines, library_name)
         class_obj = getattr(pipeline_module, class_name)
@@ -102,8 +112,8 @@ def load_single_file_sub_model(
         # Here we have to ignore loading the config from `cached_model_config_path` if `original_config` is provided
         if original_config:
             cached_model_config_path = None
-
-        loaded_sub_model = load_method(
+            
+        from_single_file_kwargs = dict(
             pretrained_model_link_or_path_or_dict=checkpoint,
             original_config=original_config,
             config=cached_model_config_path,
@@ -113,6 +123,11 @@ def load_single_file_sub_model(
             disable_mmap=disable_mmap,
             **kwargs,
         )
+
+        if per_component_quant_config is not None:
+            from_single_file_kwargs["quantization_config"] = per_component_quant_config
+
+        loaded_sub_model = load_method(**from_single_file_kwargs)
 
     elif is_transformers_model and is_clip_model_in_single_file(class_obj, checkpoint):
         loaded_sub_model = create_diffusers_clip_model_from_ldm(
@@ -135,7 +150,7 @@ def load_single_file_sub_model(
             local_files_only=local_files_only,
         )
         
-    elif is_transformers_model and is_qwen3_in_single_file(checkpoint):
+    elif is_transformers_model and is_zimage_qwen3_in_single_file(checkpoint):
         loaded_sub_model = create_diffusers_qwen3_model_from_checkpoint(
             class_obj,
             checkpoint=checkpoint,

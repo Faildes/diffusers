@@ -727,11 +727,14 @@ def infer_diffusers_model_type(checkpoint):
     ):
         model_type = "instruct-pix2pix"
 
-    elif (
-        CHECKPOINT_KEY_NAMES["z-image-turbo"] in checkpoint
-        and checkpoint[CHECKPOINT_KEY_NAMES["z-image-turbo"]].shape[0] == 2560
-    ):
-        model_type = "z-image-turbo"
+    elif any(key in checkpoint for key in CHECKPOINT_KEY_NAMES["z-image-turbo"]):
+        for k in CHECKPOINT_KEY_NAMES["z-image-turbo"]:
+            if k in checkpoint:
+                if checkpoint[k].shape[0] == 2560:
+                    model_type = "z-image-turbo"
+                    break
+        else:
+            model_type = "z-image-turbo"
 
     elif any(key in checkpoint for key in CHECKPOINT_KEY_NAMES["lumina2"]):
         model_type = "lumina2"
@@ -3859,6 +3862,8 @@ def convert_z_image_transformer_checkpoint_to_diffusers(config, checkpoint, **kw
             filtered[new_k] = v
 
         checkpoint = filtered
+
+    checkpoint.pop("norm_final.weight", None)
         
     Z_IMAGE_KEYS_RENAME_DICT = {
         "final_layer.": "all_final_layer.2-1.",
@@ -3948,7 +3953,7 @@ def is_zimage_qwen3_in_single_file(checkpoint: dict) -> bool:
 
 
 def convert_zimage_qwen3_checkpoint_to_diffusers(checkpoint: dict) -> dict:
-    prefix = "text_encoders.qwen3_4b."
+    prefix = "text_encoders.qwen3_4b.transformer.model."
     text_model_dict = {}
 
     for key, value in checkpoint.items():
