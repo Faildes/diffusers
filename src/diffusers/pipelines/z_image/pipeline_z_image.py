@@ -571,8 +571,6 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
             # 7. Prepare latents from image
             latents = self.prepare_latents(
-                init_image,
-                latent_timestep,
                 actual_batch_size,
                 num_channels_latents,
                 height,
@@ -580,7 +578,9 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 prompt_embeds[0].dtype,
                 device,
                 generator,
-                latents,
+                latents=latents,
+                image=init_image,
+                timestep=latent_timestep,
             )
             
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
