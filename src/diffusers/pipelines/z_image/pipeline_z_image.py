@@ -16,9 +16,9 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from transformers import AutoTokenizer, PreTrainedModel, Qwen2Tokenizer, Qwen3Model
+from transformers import Qwen2Tokenizer, Qwen3Model
 
-from ...image_processor import VaeImageProcessor
+from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import FromSingleFileMixin, ZImageLoraLoaderMixin
 from ...models.autoencoders import AutoencoderKL
 from ...models.transformers import ZImageTransformer2DModel
@@ -72,6 +72,20 @@ def calculate_shift(
     b = base_shift - m * base_seq_len
     mu = image_seq_len * m + b
     return mu
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -246,6 +260,18 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
         return embeddings_list
 
+    # Copied from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img.StableDiffusion3Img2ImgPipeline.get_timesteps
+    def get_timesteps(self, num_inference_steps, strength, device):
+        # get the original timestep using init_timestep
+        init_timestep = min(num_inference_steps * strength, num_inference_steps)
+
+        t_start = int(max(num_inference_steps - init_timestep, 0))
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+
+        return timesteps, num_inference_steps - t_start
+
     def prepare_latents(
         self,
         batch_size,
@@ -256,18 +282,50 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         device,
         generator,
         latents=None,
+        image=None,
+        timestep=None,
     ):
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
         width = 2 * (int(width) // (self.vae_scale_factor * 2))
 
         shape = (batch_size, num_channels_latents, height, width)
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        else:
+        if latents is not None:
             if latents.shape != shape:
                 raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
-            latents = latents.to(device)
+            return latents.to(device=device, dtype=dtype)
+        if image is not None:
+            image = image.to(device=device, dtype=dtype)
+            if image.shape[1] != num_channels_latents:
+                if isinstance(generator, list):
+                    image_latents = [
+                        retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                        for i in range(image.shape[0])
+                    ]
+                    image_latents = torch.cat(image_latents, dim=0)
+                else:
+                    image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+
+                # Apply scaling (inverse of decoding: decode does latents/scaling_factor + shift_factor)
+                image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+            else:
+                image_latents = image
+
+            # Handle batch size expansion
+            if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
+                additional_image_per_prompt = batch_size // image_latents.shape[0]
+                image_latents = torch.cat([image_latents] * additional_image_per_prompt, dim=0)
+            elif batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] != 0:
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {image_latents.shape[0]} to {batch_size} text prompts."
+                )
+
+            # Add noise using flow matching scale_noise
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            latents = self.scheduler.scale_noise(image_latents, timestep, noise)
+        else:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            
         return latents
 
     @property
@@ -295,6 +353,8 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
+        image: PipelineImageInput = None,
+        strength: float = 0.6,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -392,8 +452,20 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             `return_dict` is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the
             generated images.
         """
-        height = height or 1024
-        width = width or 1024
+        if strength < 0 or strength > 1:
+            raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
+        
+        if image is not None:
+            init_image = self.image_processor.preprocess(image)
+            init_image = init_image.to(dtype=torch.float32)
+            if height is None:
+                height = init_image.shape[-2]
+            if width is None:
+                width = init_image.shape[-1]
+        else:
+            init_image = None
+            height = height or 1024
+            width = width or 1024
 
         vae_scale = self.vae_scale_factor * 2
         if height % vae_scale != 0:
@@ -445,18 +517,6 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels
-
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            torch.float32,
-            device,
-            generator,
-            latents,
-        )
-
         # Repeat prompt_embeds for num_images_per_prompt
         if num_images_per_prompt > 1:
             prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
@@ -464,7 +524,23 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
 
         actual_batch_size = batch_size * num_images_per_prompt
-        image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+        
+        if init_image is None:
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                torch.float32,
+                device,
+                generator,
+                latents,
+            )
+            image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
+        else:
+            latent_height = 2 * (int(height) // (self.vae_scale_factor * 2))
+            latent_width = 2 * (int(width) // (self.vae_scale_factor * 2))
+            image_seq_len = (latent_height // 2) * (latent_width // 2)
 
         # 5. Prepare timesteps
         mu = calculate_shift(
@@ -483,6 +559,30 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             sigmas=sigmas,
             **scheduler_kwargs,
         )
+        if init_image is not None:
+            # 6. Adjust timesteps based on strength
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            if num_inference_steps < 1:
+                raise ValueError(
+                    f"After adjusting the num_inference_steps by strength parameter: {strength}, the number of pipeline "
+                    f"steps is {num_inference_steps} which is < 1 and not appropriate for this pipeline."
+                )
+            latent_timestep = timesteps[:1].repeat(actual_batch_size)
+
+            # 7. Prepare latents from image
+            latents = self.prepare_latents(
+                init_image,
+                latent_timestep,
+                actual_batch_size,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds[0].dtype,
+                device,
+                generator,
+                latents,
+            )
+            
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
@@ -525,7 +625,10 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
                 model_out_list = self.transformer(
-                    latent_model_input_list, timestep_model_input, prompt_embeds_model_input, return_dict=False
+                    latent_model_input_list, 
+                    timestep_model_input, 
+                    prompt_embeds_model_input, 
+                    return_dict=init_image is not None,
                 )[0]
 
                 if apply_cfg:
