@@ -69,6 +69,7 @@ class FlowMatchEulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
         stochastic_sampling: bool = False,
         # new: default True because this scheduler is "Ancestral"
         ancestral_sampling: bool = True,
+        eta: float = 0.75,
     ):
         if self.config.use_beta_sigmas and not is_scipy_available():
             raise ImportError("Make sure to install scipy if you want to use beta sigmas.")
@@ -172,6 +173,39 @@ class FlowMatchEulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
         stretched_t = 1 - (one_minus_z / scale_factor)
         return stretched_t
 
+    def _append_dims(self, x: torch.Tensor, target_ndim: int) -> torch.Tensor:
+        while x.ndim < target_ndim:
+            x = x.unsqueeze(-1)
+        return x
+
+    def _ancestral_split(self, sigma_from: torch.Tensor, sigma_to: torch.Tensor, eta: float):
+        eps = 1e-20
+        sigma_from_sq = sigma_from * sigma_from
+        sigma_to_sq = sigma_to * sigma_to
+
+        frac = sigma_to_sq * (sigma_from_sq - sigma_to_sq) / torch.clamp(sigma_from_sq, min=eps)
+        frac = torch.clamp(frac, min=0.0)
+
+        sigma_up = (eta * torch.sqrt(frac))
+        sigma_up = torch.minimum(sigma_up, sigma_to)
+
+        sigma_down_sq = torch.clamp(sigma_to_sq - sigma_up * sigma_up, min=0.0)
+        sigma_down = torch.sqrt(sigma_down_sq)
+        return sigma_down, sigma_up
+
+    def _get_sigmas(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device.type, device.index, dtype)
+        cache = getattr(self, "_sigmas_cache", None)
+        if cache is None:
+            cache = {}
+            self._sigmas_cache = cache
+
+        sig = cache.get(key, None)
+        if sig is None or sig.shape != self.sigmas.shape:
+            sig = self.sigmas.to(device=device, dtype=dtype)
+            cache[key] = sig
+        return sig
+
     def set_timesteps(
         self,
         num_inference_steps: Optional[int] = None,
@@ -241,6 +275,7 @@ class FlowMatchEulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         self.timesteps = timesteps
         self.sigmas = sigmas
+        self._sigmas_cache = {}
         self._step_index = None
         self._begin_index = None
 
@@ -293,49 +328,59 @@ class FlowMatchEulerAncestralDiscreteScheduler(SchedulerMixin, ConfigMixin):
         use_ancestral = bool(getattr(self.config, "ancestral_sampling", True) or getattr(self.config, "stochastic_sampling", False))
 
         if per_token_timesteps is not None:
-            per_token_sigmas = per_token_timesteps / self.config.num_train_timesteps
+            calc_dtype = torch.float32 if sample.dtype in (torch.float16, torch.bfloat16) else sample.dtype
+            sample_f = sample.to(calc_dtype)
+            model_out_f = model_output.to(calc_dtype)
 
-            sigmas = self.sigmas[:, None, None]
-            lower_mask = sigmas < per_token_sigmas[None] - 1e-6
-            lower_sigmas = lower_mask * sigmas
-            lower_sigmas, _ = lower_sigmas.max(dim=0)
+            per_token_sigmas = (per_token_timesteps.to(device=sample.device, dtype=calc_dtype)
+                                / self.config.num_train_timesteps)
 
-            sigma_from = per_token_sigmas[..., None]     # current sigma
-            sigma_to = lower_sigmas[..., None]           # next sigma in schedule
+            sigmas = self._get_sigmas(sample.device, calc_dtype)
+            sigmas_asc = torch.flip(sigmas, dims=[0])  # 0 -> ... -> max
 
-            dt_plain = sigma_to - sigma_from
+            per_token_sigmas_clamped = per_token_sigmas.clamp(min=sigmas_asc[0], max=sigmas_asc[-1])
 
-            # v field update is model_output (same shape as sample)
-            x0 = sample_f - sigma_from * model_output
+            pos = torch.searchsorted(sigmas_asc, per_token_sigmas_clamped, right=False)
+            idx = (pos - 1).clamp(min=0, max=sigmas_asc.numel() - 1)
+
+            flat_idx = idx.reshape(-1)
+            sigma_to = sigmas_asc.take(flat_idx).reshape(idx.shape)
+            sigma_from = per_token_sigmas
+
+            sigma_from_e = self._append_dims(sigma_from, sample_f.ndim)
+            sigma_to_e   = self._append_dims(sigma_to,   sample_f.ndim)
+
+            x0 = sample_f - sigma_from_e * model_out_f
+
+            use_ancestral = bool(
+                getattr(self.config, "ancestral_sampling", True)
+                or getattr(self.config, "stochastic_sampling", False)
+            )
 
             if not use_ancestral:
-                prev_sample = sample_f + dt_plain * model_output
+                dt = sigma_to_e - sigma_from_e
+                prev_sample = sample_f + dt * model_out_f
             else:
-                # elementwise ancestral split
-                eps = 1e-12
-                sigma_from_sq = sigma_from * sigma_from
-                sigma_to_sq = sigma_to * sigma_to
+                eta = float(getattr(self.config, "eta", 1.0))
+                sigma_down, sigma_up = self._ancestral_split(sigma_from_e, sigma_to_e, eta=eta)
+                dt = sigma_down - sigma_from_e
+                prev_sample = sample_f + dt * model_out_f
 
-                frac = sigma_to_sq * (sigma_from_sq - sigma_to_sq) / (sigma_from_sq + eps)
-                frac = torch.clamp(frac, min=0.0)
-                sigma_up = torch.sqrt(frac)
+                if torch.any(sigma_up > 0):
+                    noise = randn_tensor(
+                        sample_f.shape, dtype=sample_f.dtype, device=sample_f.device, generator=generator
+                    )
+                    prev_sample = prev_sample + noise * sigma_up * float(s_noise)
 
-                sigma_down_sq = torch.clamp(sigma_to_sq - sigma_up * sigma_up, min=0.0)
-                sigma_down = torch.sqrt(sigma_down_sq)
+            prev_sample = prev_sample.to(model_output.dtype)
 
-                dt = sigma_down - sigma_from
-                prev_sample = sample_f + dt * model_output
+            self._step_index = (self._step_index + 1) if (self._step_index is not None) else 1
 
-                noise = randn_tensor(
-                    model_output.shape, dtype=sample_f.dtype, device=sample_f.device, generator=generator
-                )
-                prev_sample = prev_sample + noise * sigma_up * s_noise
-
-            # per_token mode: keep fp32 by default
             if not return_dict:
                 return (prev_sample, x0)
 
             return FlowMatchEulerAncestralDiscreteSchedulerOutput(prev_sample=prev_sample, pred_original_sample=x0)
+
 
         # Scalar sigma path (standard)
         sigma_idx = self.step_index
