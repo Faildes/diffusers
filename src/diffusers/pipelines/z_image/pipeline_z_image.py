@@ -360,6 +360,7 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         num_inference_steps: int = 50,
         sigmas: Optional[List[float]] = None,
         guidance_scale: float = 5.0,
+        negative_guidance_scale: float = 0.0,
         cfg_normalization: bool = False,
         cfg_truncation: float = 1.0,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -482,6 +483,12 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         device = self._execution_device
 
         self._guidance_scale = guidance_scale
+        self._negative_guidance_scale = float(negative_guidance_scale or 0.0)
+
+        need_negative = self.do_classifier_free_guidance or (
+            self._negative_guidance_scale > 0.0 and (negative_prompt is not None or negative_prompt_embeds is not None)
+        )
+
         self._joint_attention_kwargs = joint_attention_kwargs
         self._interrupt = False
         self._cfg_normalization = cfg_normalization
@@ -508,7 +515,7 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             ) = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                do_classifier_free_guidance=need_negative,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 device=device,
@@ -611,7 +618,12 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 # Run CFG only if configured AND scale is non-zero
                 apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
 
-                if apply_cfg:
+                apply_neg = (not apply_cfg) and has_user_negative and (self._negative_guidance_scale > 0.0)
+
+                need_dual = apply_cfg or apply_neg
+
+
+                if need_dual:
                     latents_typed = latents.to(self.transformer.dtype)
                     latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                     prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
@@ -631,17 +643,19 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                     return_dict=init_image is not None,
                 )[0]
 
-                if apply_cfg:
+                if need_dual:
                     # Perform CFG
                     pos_out = model_out_list[:actual_batch_size]
                     neg_out = model_out_list[actual_batch_size:]
+
+                    scale = current_guidance_scale if apply_cfg else self._negative_guidance_scale
 
                     noise_pred = []
                     for j in range(actual_batch_size):
                         pos = pos_out[j].float()
                         neg = neg_out[j].float()
 
-                        pred = pos + current_guidance_scale * (pos - neg)
+                        pred = pos + scale * (pos - neg)
 
                         # Renormalization
                         if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
