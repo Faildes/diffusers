@@ -348,6 +348,16 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
     def interrupt(self):
         return self._interrupt
 
+    def _rescale_like(ref: torch.Tensor, x: torch.Tensor, factor: float = 0.7, eps: float = 1e-6):
+    # ref/x: (B,C,1,H,W) or (B,C,H,W)
+    if factor <= 0.0:
+        return x
+    dims = tuple(range(1, x.ndim))
+    ref_std = ref.float().std(dim=dims, keepdim=True)
+    x_std   = x.float().std(dim=dims, keepdim=True)
+    x_rs = x * (ref_std / (x_std + eps))
+    return ref + factor * (x_rs - ref)
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -494,6 +504,9 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         else:
             batch_size = len(prompt_embeds)
 
+        wants_negative = (negative_prompt is not None) or (negative_prompt_embeds is not None)
+        need_negative = self.do_classifier_free_guidance or wants_negative
+
         # If prompt_embeds is provided and prompt is None, skip encoding
         if prompt_embeds is not None and prompt is None:
             if self.do_classifier_free_guidance and negative_prompt_embeds is None:
@@ -508,7 +521,7 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             ) = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                do_classifier_free_guidance=need_negative,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
                 device=device,
@@ -520,7 +533,7 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         # Repeat prompt_embeds for num_images_per_prompt
         if num_images_per_prompt > 1:
             prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
-            if self.do_classifier_free_guidance and negative_prompt_embeds:
+            if need_negative and negative_prompt_embeds:
                 negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
 
         actual_batch_size = batch_size * num_images_per_prompt
@@ -610,8 +623,12 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
 
                 # Run CFG only if configured AND scale is non-zero
                 apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
+                apply_neg_only = (not apply_cfg) and wants_negative and bool(negative_prompt_embeds)
 
-                if apply_cfg:
+                need_dual = apply_cfg or apply_neg_only
+                
+
+                if need_dual:
                     latents_typed = latents.to(self.transformer.dtype)
                     latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                     prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
@@ -631,31 +648,27 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                     return_dict=init_image is not None,
                 )[0]
 
-                if apply_cfg:
-                    # Perform CFG
-                    pos_out = model_out_list[:actual_batch_size]
-                    neg_out = model_out_list[actual_batch_size:]
+                model_out = torch.stack([x.float() for x in model_out_list], dim=0)
 
-                    noise_pred = []
-                    for j in range(actual_batch_size):
-                        pos = pos_out[j].float()
-                        neg = neg_out[j].float()
+                
+                if need_dual:
+                    pos = model_out[:actual_batch_size]
+                    neg = model_out[actual_batch_size:]
+                    
+                    scale = float(current_guidance_scale) if apply_cfg else float(self._guidance_scale)
 
-                        pred = pos + current_guidance_scale * (pos - neg)
+                    g = (pos - neg)
 
-                        # Renormalization
-                        if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
-                            ori_pos_norm = torch.linalg.vector_norm(pos)
-                            new_pos_norm = torch.linalg.vector_norm(pred)
-                            max_new_norm = ori_pos_norm * float(self._cfg_normalization)
-                            if new_pos_norm > max_new_norm:
-                                pred = pred * (max_new_norm / new_pos_norm)
+                    spatial_dims = tuple(range(2, g.ndim))
+                    g = g - g.mean(dim=spatial_dims, keepdim=True)
 
-                        noise_pred.append(pred)
+                    pred = pos + scale * g
 
-                    noise_pred = torch.stack(noise_pred, dim=0)
+                    pred = self._rescale_like(pos, pred, factor=0.7)
+
+                    noise_pred = pred
                 else:
-                    noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
+                    noise_pred = model_out
 
                 noise_pred = noise_pred.squeeze(2)
                 noise_pred = -noise_pred
