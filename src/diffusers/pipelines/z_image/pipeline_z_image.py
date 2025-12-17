@@ -348,16 +348,37 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
     def interrupt(self):
         return self._interrupt
 
-    def _rescale_like_(self, ref: torch.Tensor, x: torch.Tensor, factor: float = 0.7, eps: float = 1e-6):
-        if factor <= 0.0:
-            return x
-        dims = (1, 2, 3, 4)
-        ref_std = ref.std(dim=dims, keepdim=True)
-        x_std   = x.std(dim=dims, keepdim=True)
-        ratio = ref_std / (x_std + eps)
-        x.mul_(ratio)
-        x.mul_(factor).add_(ref, alpha=(1.0 - factor))
-        return x
+    def _fold_negative_into_prompt_embeds(
+        self,
+        prompt_embeds: List[torch.Tensor],
+        negative_prompt_embeds: List[torch.Tensor],
+        scale: float,
+        eps: float = 1e-6,
+    ) -> List[torch.Tensor]:
+        out: List[torch.Tensor] = []
+        for pe, ne in zip(prompt_embeds, negative_prompt_embeds):
+            Lp, D = pe.shape
+            Ln = ne.shape[0]
+    
+            if Ln < Lp:
+                ne_m = torch.cat((ne, ne[-1:].expand(Lp - Ln, D)), dim=0)
+            elif Ln > Lp:
+                ne_m = ne[:Lp]
+            else:
+                ne_m = ne
+    
+            # fold: pe' = pe + s*(pe - ne)
+            x = pe + scale * (pe - ne_m)
+    
+            mu0 = pe.mean(dim=0, keepdim=True)
+            sd0 = pe.std(dim=0, keepdim=True)
+    
+            mu = x.mean(dim=0, keepdim=True)
+            sd = x.std(dim=0, keepdim=True)
+    
+            x = (x - mu) * (sd0 / (sd + eps)) + mu0
+            out.append(x)
+        return out
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -537,6 +558,12 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
             if need_negative and negative_prompt_embeds:
                 negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
 
+        prompt_embeds_folded = None
+        if wants_negative and negative_prompt_embeds:
+            prompt_embeds_folded = self._fold_negative_into_prompt_embeds(
+                prompt_embeds, negative_prompt_embeds, scale=float(self._guidance_scale)
+            )
+            
         actual_batch_size = batch_size * num_images_per_prompt
         
         if init_image is None:
@@ -600,10 +627,6 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
-        prompt_embeds_dual = (prompt_embeds + negative_prompt_embeds) if (need_negative and negative_prompt_embeds) else None
-        timesteps_f = (1000 - timesteps) / 1000
-        batch = latents.shape[0]
-
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -611,65 +634,68 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                     continue
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                t_norm_scalar = float(timesteps_f[i].item())
+                timestep = t.expand(latents.shape[0])
+                timestep = (1000 - timestep) / 1000
+                # Normalized time for time-aware config (0 at start, 1 at end)
+                t_norm = timestep[0].item()
 
                 # Handle cfg truncation
                 current_guidance_scale = self.guidance_scale
-                if self.do_classifier_free_guidance and self._cfg_truncation is not None and float(self._cfg_truncation) <= 1:
-                    if t_norm_scalar > self._cfg_truncation:
+                if (
+                    self.do_classifier_free_guidance
+                    and self._cfg_truncation is not None
+                    and float(self._cfg_truncation) <= 1
+                ):
+                    if t_norm > self._cfg_truncation:
                         current_guidance_scale = 0.0
-        
-                apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0.0
-                apply_neg_only = (not apply_cfg) and wants_negative and bool(negative_prompt_embeds)
-                need_dual = apply_cfg or apply_neg_only
 
-                timestep = timesteps_f[i].expand(batch)
-
-                latents_typed = latents.to(dtype=self.transformer.dtype)
+                # Run CFG only if configured AND scale is non-zero
+                apply_cfg = self.do_classifier_free_guidance and current_guidance_scale > 0
                 
 
-                if need_dual:
-                    latent_model_input = latents_typed.repeat(2, 1, 1, 1).unsqueeze(2)
+                if apply_cfg:
+                    latents_typed = latents.to(self.transformer.dtype)
+                    latent_model_input = latents_typed.repeat(2, 1, 1, 1)
+                    prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                     timestep_model_input = timestep.repeat(2)
-                    prompt_embeds_model_input = prompt_embeds_dual
                 else:
-                    latent_model_input = latents_typed.unsqueeze(2)
+                    latents_typed = latents.to(self.transformer.dtype)
+                    latent_model_input = latents_typed
+                    prompt_embeds_model_input = prompt_embeds_folded if (prompt_embeds_folded is not None) else prompt_embeds
                     timestep_model_input = timestep
-                    prompt_embeds_model_input = prompt_embeds
-
-                latent_model_input_tuple = latent_model_input.unbind(dim=0)
-
+                
+                latent_model_input = latent_model_input.unsqueeze(2)
+                latent_model_input_list = list(latent_model_input.unbind(dim=0))
+                
                 model_out_list = self.transformer(
-                    latent_model_input_tuple,
+                    latent_model_input_list,
                     timestep_model_input,
                     prompt_embeds_model_input,
                     return_dict=init_image is not None,
                 )[0]
+                
+                model_out = torch.stack([x.float() for x in model_out_list], dim=0)
 
-                model_out = torch.stack(model_out_list, dim=0)
-                if model_out.dtype != torch.float32:
-                    model_out = model_out.float()
-        
-                if need_dual:
+                
+                if apply_cfg:
                     pos = model_out[:actual_batch_size]
                     neg = model_out[actual_batch_size:]
-        
-                    scale = float(current_guidance_scale) if apply_cfg else float(self._guidance_scale)
-        
-                    g = pos.sub(neg)
-                    g.sub_(g.mean(dim=(2, 3, 4), keepdim=True))
-                    g.mul_(scale).add_(pos)
-        
-                    self._rescale_like_(pos, g, factor=0.7)
-        
-                    noise_pred = g
+                
+                    g = (pos - neg)
+                    g = g - g.mean(dim=(2, 3, 4), keepdim=True)
+                
+                    pred = pos + float(current_guidance_scale) * g
+                    pred = self._rescale_like(pos, pred, factor=0.7)
+                
+                    noise_pred = pred
                 else:
                     noise_pred = model_out
-        
+
                 noise_pred = noise_pred.squeeze(2)
-                noise_pred.neg_()
-        
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                noise_pred = -noise_pred
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
                 assert latents.dtype == torch.float32
 
                 if callback_on_step_end is not None:
