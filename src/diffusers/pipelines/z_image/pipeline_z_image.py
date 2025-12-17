@@ -348,15 +348,14 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
     def interrupt(self):
         return self._interrupt
 
-    def _rescale_like(ref: torch.Tensor, x: torch.Tensor, factor: float = 0.7, eps: float = 1e-6):
-    # ref/x: (B,C,1,H,W) or (B,C,H,W)
-    if factor <= 0.0:
-        return x
-    dims = tuple(range(1, x.ndim))
-    ref_std = ref.float().std(dim=dims, keepdim=True)
-    x_std   = x.float().std(dim=dims, keepdim=True)
-    x_rs = x * (ref_std / (x_std + eps))
-    return ref + factor * (x_rs - ref)
+    def _rescale_like(self, ref: torch.Tensor, x: torch.Tensor, factor: float = 0.7, eps: float = 1e-6):
+        if factor <= 0.0:
+            return x
+        dims = tuple(range(1, x.ndim))
+        ref_std = ref.float().std(dim=dims, keepdim=True)
+        x_std   = x.float().std(dim=dims, keepdim=True)
+        x_rs = x * (ref_std / (x_std + eps))
+        return ref + factor * (x_rs - ref)
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -654,7 +653,7 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 if need_dual:
                     pos = model_out[:actual_batch_size]
                     neg = model_out[actual_batch_size:]
-                    
+
                     scale = float(current_guidance_scale) if apply_cfg else float(self._guidance_scale)
 
                     g = (pos - neg)
