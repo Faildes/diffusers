@@ -673,23 +673,33 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                     prompt_embeds_model_input,
                     return_dict=init_image is not None,
                 )[0]
-                
-                model_out = torch.stack([x.float() for x in model_out_list], dim=0)
 
                 
                 if apply_cfg:
-                    pos = model_out[:actual_batch_size]
-                    neg = model_out[actual_batch_size:]
-                
-                    g = (pos - neg)
-                    g = g - g.mean(dim=(2, 3, 4), keepdim=True)
-                
-                    pred = pos + float(current_guidance_scale) * g
-                    pred = self._rescale_like(pos, pred, factor=0.7)
-                
-                    noise_pred = pred
+                    # Perform CFG
+                    pos_out = model_out_list[:actual_batch_size]
+                    neg_out = model_out_list[actual_batch_size:]
+
+                    noise_pred = []
+                    for j in range(actual_batch_size):
+                        pos = pos_out[j].float()
+                        neg = neg_out[j].float()
+
+                        pred = pos + current_guidance_scale * (pos - neg)
+
+                        # Renormalization
+                        if self._cfg_normalization and float(self._cfg_normalization) > 0.0:
+                            ori_pos_norm = torch.linalg.vector_norm(pos)
+                            new_pos_norm = torch.linalg.vector_norm(pred)
+                            max_new_norm = ori_pos_norm * float(self._cfg_normalization)
+                            if new_pos_norm > max_new_norm:
+                                pred = pred * (max_new_norm / new_pos_norm)
+
+                        noise_pred.append(pred)
+
+                    noise_pred = torch.stack(noise_pred, dim=0)
                 else:
-                    noise_pred = model_out
+                    noise_pred = torch.stack([x.float() for x in model_out_list], dim=0)
 
                 noise_pred = noise_pred.squeeze(2)
                 noise_pred = -noise_pred
